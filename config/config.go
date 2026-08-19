@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	_ "unsafe"
 
@@ -360,6 +361,19 @@ type RawProfile struct {
 	StoreFakeIP   bool `yaml:"store-fake-ip" json:"store-fake-ip"`
 }
 
+type RawSubscription struct {
+	Enable           bool   `yaml:"enable" json:"enable"`
+	Directory        string `yaml:"directory" json:"directory"`                 // profiles 目录,如 /root/clashctl/resources
+	MetaFile         string `yaml:"meta-file" json:"meta-file"`                 // profiles.yaml 路径,默认 {directory}/profiles.yaml
+	MixinFile        string `yaml:"mixin-file" json:"mixin-file"`               // 默认 {directory}/mixin.yaml
+	RuntimeFile      string `yaml:"runtime-file" json:"runtime-file"`           // 默认 {directory}/runtime.yaml
+	Subconverter     string `yaml:"subconverter" json:"subconverter"`           // subconverter 二进制路径(可空, 为空则不转换直接当原生配置)
+	SubconverterPort int    `yaml:"subconverter-port" json:"subconverter-port"` // 默认 25500
+	Yq               string `yaml:"yq" json:"yq"`                               // yq 二进制路径(可空, 为空则不合并仅重拉)
+	UA               string `yaml:"ua" json:"ua"`                               // 下载 UA, 默认 "mihomo"
+	Timeout          int    `yaml:"timeout" json:"timeout"`                     // 下载超时秒, 默认 30
+}
+
 type RawGeoXUrl struct {
 	GeoIp   string `yaml:"geoip" json:"geoip"`
 	Mmdb    string `yaml:"mmdb" json:"mmdb"`
@@ -462,8 +476,33 @@ type RawConfig struct {
 	GeoXUrl       RawGeoXUrl                `yaml:"geox-url" json:"geox-url"`
 	Sniffer       RawSniffer                `yaml:"sniffer" json:"sniffer"`
 	TLS           RawTLS                    `yaml:"tls" json:"tls"`
+	Subscription  RawSubscription           `yaml:"subscription" json:"subscription"`
 
 	ClashForAndroid RawClashForAndroid `yaml:"clash-for-android" json:"clash-for-android"`
+}
+
+// subscriptionCfg holds the subscription config of the config file that
+// explicitly declares a `subscription:` section. It is refreshed while
+// unmarshalling so the hub/route package can access it without extra plumbing.
+// It is protected by a RWMutex because config parsing (startup/reload) and API
+// requests run concurrently.
+var (
+	subscriptionCfgMu sync.RWMutex
+	subscriptionCfg   RawSubscription
+)
+
+// SetSubscriptionCfg updates the global subscription config.
+func SetSubscriptionCfg(c RawSubscription) {
+	subscriptionCfgMu.Lock()
+	subscriptionCfg = c
+	subscriptionCfgMu.Unlock()
+}
+
+// GetSubscriptionCfg returns the subscription config of the currently loaded config.
+func GetSubscriptionCfg() RawSubscription {
+	subscriptionCfgMu.RLock()
+	defer subscriptionCfgMu.RUnlock()
+	return subscriptionCfg
 }
 
 // Parse config
@@ -491,13 +530,23 @@ func DefaultRawConfig() *RawConfig {
 		Authentication:    []string{},
 		LogLevel:          log.INFO,
 		Hosts:             map[string]any{},
-		Rule:              []string{},
+		Rule:              []string{"MATCH,Auto"},
 		Proxy:             []map[string]any{},
-		ProxyGroup:        []map[string]any{},
-		TCPConcurrent:     false,
-		FindProcessMode:   process.FindProcessStrict,
-		GlobalUA:          "clash.meta/" + C.Version,
-		ETagSupport:       true,
+		ProxyGroup: []map[string]any{
+			{
+				"name":            "Auto",
+				"type":            "auto-url-test",
+				"url":             C.DefaultTestURL,
+				"expected-status": "*",
+				"include-direct":  true,
+				"affinity-ttl":    600,
+				"proxies":         []string{"DIRECT"},
+			},
+		},
+		TCPConcurrent:   false,
+		FindProcessMode: process.FindProcessStrict,
+		GlobalUA:        "clash.meta/" + C.Version,
+		ETagSupport:     true,
 		DNS: RawDNS{
 			Enable:         false,
 			IPv6:           false,
@@ -575,6 +624,12 @@ func DefaultRawConfig() *RawConfig {
 		Profile: RawProfile{
 			StoreSelected: true,
 		},
+		Subscription: RawSubscription{
+			Enable:           false,
+			SubconverterPort: 25500,
+			UA:               "mihomo",
+			Timeout:          30,
+		},
 		GeoXUrl: RawGeoXUrl{
 			Mmdb:    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
 			ASN:     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb",
@@ -609,8 +664,30 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 		return nil, fmt.Errorf("decrypt config error: %w", err)
 	}
 
+	// peek which top-level keys the user explicitly wrote, so we can tell
+	// whether the default proxy-groups/rules should take effect or not
+	var keys map[string]any
+	if err := yaml.Unmarshal(buf, &keys); err != nil {
+		return nil, err
+	}
+
 	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
+	}
+
+	// default proxy-groups/rules only apply when the user writes neither of them:
+	// if the user defines custom proxy-groups but no rules, drop the default
+	// "MATCH,Auto" rule, otherwise it would reference a missing group
+	if _, ok := keys["proxy-groups"]; ok {
+		if _, ok := keys["rules"]; !ok {
+			rawCfg.Rule = []string{}
+		}
+	}
+
+	// track the subscription config of the config that explicitly declares it,
+	// so the hub/route package can reach it after parsing
+	if _, ok := keys["subscription"]; ok {
+		SetSubscriptionCfg(rawCfg.Subscription)
 	}
 
 	return rawCfg, nil

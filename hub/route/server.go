@@ -98,6 +98,16 @@ func ReCreateServer(cfg *Config) {
 	}
 }
 
+// StartSubscriptionRestore re-applies the active subscription recorded in the
+// meta file. It must run after the kernel's initial config application
+// (executor.ApplyConfig) has finished, so hub.ApplyConfig calls it after the
+// executor; never run it from ReCreateServer (that fires before the executor
+// apply and races on live kernel state). No-op when subscription is disabled
+// or nothing is active. Errors are logged, never fatal.
+func StartSubscriptionRestore() {
+	go restoreActiveSubscription()
+}
+
 func SetUIPath(path string) {
 	uiPath = C.Path.Resolve(path)
 }
@@ -139,6 +149,7 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 			r.Mount("/restart", restartRouter())
 		}
 		r.Mount("/upgrade", upgradeRouter())
+		r.Mount("/subscriptions", subscriptionRouter())
 		addExternalRouters(r)
 
 	})

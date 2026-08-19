@@ -55,6 +55,9 @@ func WithSecret(secret string) Option {
 func ApplyConfig(cfg *config.Config) {
 	applyRoute(cfg)
 	executor.ApplyConfig(cfg, true)
+	// restore the active subscription only after the executor has finished
+	// applying the base config, so it never races on live kernel state
+	route.StartSubscriptionRestore()
 }
 
 func applyRoute(cfg *config.Config) {

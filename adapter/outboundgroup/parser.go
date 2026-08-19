@@ -118,6 +118,28 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		return nil, fmt.Errorf("%s: %w", groupName, errMissProxy)
 	}
 
+	var autoURLTestOption AutoURLTestOption
+	if groupOption.Type == "auto-url-test" {
+		if err := decoder.Decode(config, &autoURLTestOption); err != nil {
+			return nil, err
+		}
+
+		if autoURLTestOption.IncludeDirect == nil || *autoURLTestOption.IncludeDirect {
+			hasDirect := false
+			for _, name := range groupOption.Proxies {
+				if name == "DIRECT" {
+					hasDirect = true
+					break
+				}
+			}
+			if !hasDirect && len(groupOption.Proxies) != 0 {
+				if _, ok := proxyMap["DIRECT"]; ok {
+					groupOption.Proxies = append([]string{"DIRECT"}, groupOption.Proxies...)
+				}
+			}
+		}
+	}
+
 	expectedStatus, err := utils.NewUnsignedRanges[uint16](groupOption.ExpectedStatus)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", groupName, err)
@@ -213,6 +235,8 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			return nil, err
 		}
 		return NewLoadBalance(groupOption, opt, emptyFallback, providers)
+	case "auto-url-test":
+		return NewAutoURLTest(groupOption, autoURLTestOption, emptyFallback, providers)
 	case "relay":
 		return nil, fmt.Errorf("%w: The group [%s] with relay type was removed, please using dialer-proxy instead", errType, groupName)
 	default:

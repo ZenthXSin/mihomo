@@ -54,6 +54,7 @@ const (
 	Tailscale
 	ZeroTier
 	GostRelay
+	AutoURLTest
 )
 
 const (
@@ -249,6 +250,8 @@ func (at AdapterType) String() string {
 		return "URLTest"
 	case LoadBalance:
 		return "LoadBalance"
+	case AutoURLTest:
+		return "AutoURLTest"
 	default:
 		return "Unknown"
 	}

@@ -30,6 +30,7 @@ func proxyRouter() http.Handler {
 		r.Get("/", getProxy)
 		r.Get("/delay", getProxyDelay)
 		r.Put("/", updateProxy)
+		r.Patch("/", updateProxy)
 		r.Delete("/", unfixedProxy)
 	})
 	return r
@@ -73,7 +74,9 @@ func getProxy(w http.ResponseWriter, r *http.Request) {
 
 func updateProxy(w http.ResponseWriter, r *http.Request) {
 	req := struct {
-		Name string `json:"name"`
+		Name          string `json:"name"`
+		AffinityTTL   *int   `json:"affinityTTL"`
+		ClearAffinity bool   `json:"clearAffinity"`
 	}{}
 	if err := render.DecodeJSON(r.Body, &req); err != nil {
 		render.Status(r, http.StatusBadRequest)
@@ -82,7 +85,26 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
-	selector, ok := proxy.Adapter().(outboundgroup.SelectAble)
+	adapter := proxy.Adapter()
+	if autoURLTest, ok := adapter.(*outboundgroup.AutoURLTest); ok {
+		if req.AffinityTTL != nil {
+			if *req.AffinityTTL <= 0 {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, newError("affinityTTL must be greater than 0"))
+				return
+			}
+			autoURLTest.SetAffinityTTL(*req.AffinityTTL)
+			render.NoContent(w, r)
+			return
+		}
+		if req.ClearAffinity {
+			autoURLTest.ClearAffinity()
+			render.NoContent(w, r)
+			return
+		}
+	}
+
+	selector, ok := adapter.(outboundgroup.SelectAble)
 	if !ok {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, newError("Must be a Selector"))
