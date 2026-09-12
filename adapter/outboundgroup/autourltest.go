@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -18,9 +19,12 @@ import (
 )
 
 type AutoURLTestOption struct {
-	Tolerance     uint16 `group:"tolerance,omitempty"`
-	AffinityTTL   int    `group:"affinity-ttl,omitempty"`
-	IncludeDirect *bool  `group:"include-direct,omitempty"`
+	Tolerance       uint16   `group:"tolerance,omitempty"`
+	AffinityTTL     int      `group:"affinity-ttl,omitempty"`
+	IncludeDirect   *bool    `group:"include-direct,omitempty"`
+	AutoSelect      *bool    `group:"auto-select,omitempty"`
+	AutoSelectPorts []uint16 `group:"auto-select-ports,omitempty"`
+	FixedPorts      []uint16 `group:"fixed-ports,omitempty"`
 }
 
 type affinityEntry struct {
@@ -30,16 +34,19 @@ type affinityEntry struct {
 
 type AutoURLTest struct {
 	*GroupBase
-	selected       string
-	fastNode       C.Proxy
-	fastSingle     *singledo.Single[C.Proxy]
-	affinity       *xsync.Map[string, affinityEntry]
-	probing        *xsync.Map[string, *singledo.Single[struct{}]]
-	tolerance      uint16
-	disableUDP     bool
-	affinityTTL    atomic.Int64
-	testUrl        string
-	expectedStatus string
+	selected        string
+	fastNode        C.Proxy
+	fastSingle      *singledo.Single[C.Proxy]
+	affinity        *xsync.Map[string, affinityEntry]
+	probing         *xsync.Map[string, *singledo.Single[struct{}]]
+	tolerance       uint16
+	disableUDP      bool
+	affinityTTL     atomic.Int64
+	autoSelect      atomic.Bool
+	autoSelectPorts map[uint16]struct{}
+	fixedPorts      map[uint16]struct{}
+	testUrl         string
+	expectedStatus  string
 }
 
 var _ ProxyGroup = (*AutoURLTest)(nil)
@@ -76,22 +83,71 @@ func (a *AutoURLTest) ForceSet(name string) {
 	a.affinity.Clear()
 }
 
+// shouldAutoSelect reports whether the given inbound port should use
+// per-target auto selection. fixed-ports wins over auto-select-ports,
+// and either list wins over the runtime autoSelect toggle.
+func (a *AutoURLTest) shouldAutoSelect(metadata *C.Metadata) bool {
+	if metadata == nil || metadata.InPort == 0 {
+		return a.autoSelect.Load()
+	}
+	if _, ok := a.fixedPorts[metadata.InPort]; ok {
+		return false
+	}
+	if _, ok := a.autoSelectPorts[metadata.InPort]; ok {
+		return true
+	}
+	return a.autoSelect.Load()
+}
+
+// portSet indexes a port list for O(1) membership tests; nil when empty.
+// Built once at construction and never mutated afterwards.
+func portSet(ports []uint16) map[uint16]struct{} {
+	if len(ports) == 0 {
+		return nil
+	}
+	set := make(map[uint16]struct{}, len(ports))
+	for _, port := range ports {
+		set[port] = struct{}{}
+	}
+	return set
+}
+
+// sortedPorts returns the ports of a port set in ascending order for a
+// stable JSON output; an empty (non-nil) slice when the set is empty.
+func sortedPorts(set map[uint16]struct{}) []uint16 {
+	if len(set) == 0 {
+		return []uint16{}
+	}
+	ports := make([]uint16, 0, len(set))
+	for port := range set {
+		ports = append(ports, port)
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+	return ports
+}
+
 // DialContext implements C.ProxyAdapter
 func (a *AutoURLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxy := a.fast(true)
 
 	key := ""
-	if metadata != nil && metadata.Valid() {
-		key = metadata.RemoteAddress()
-	}
-
 	fromAffinity := false
-	if key != "" {
-		if entry, ok := a.getAffinity(key); ok {
-			proxy = entry
-			fromAffinity = true
-		} else {
-			go a.probeTarget(key)
+	if a.shouldAutoSelect(metadata) {
+		// per-target affinity lookup and background probing only apply
+		// while auto-select is active for this inbound port (fixed-ports
+		// and auto-select-ports override the runtime toggle); otherwise
+		// every dial goes straight through the current fastest node like
+		// a plain url-test group
+		if metadata != nil && metadata.Valid() {
+			key = metadata.RemoteAddress()
+		}
+		if key != "" {
+			if entry, ok := a.getAffinity(key); ok {
+				proxy = entry
+				fromAffinity = true
+			} else {
+				go a.probeTarget(key)
+			}
 		}
 	}
 
@@ -191,6 +247,13 @@ func (a *AutoURLTest) doProbe(key string) {
 		}
 	}
 	if best != nil {
+		if !a.autoSelect.Load() && len(a.autoSelectPorts) == 0 {
+			// auto-select was disabled while this probe was in flight and
+			// no auto-select-ports are configured to keep per-target
+			// selection alive; its result must not be recorded as
+			// per-target affinity
+			return
+		}
 		a.cleanExpiredAffinity()
 		a.affinity.Store(key, affinityEntry{
 			proxy:  best,
@@ -329,17 +392,20 @@ func (a *AutoURLTest) MarshalJSON() ([]byte, error) {
 		return true
 	})
 	return json.Marshal(map[string]any{
-		"type":           a.Type().String(),
-		"now":            a.Now(),
-		"all":            all,
-		"testUrl":        a.testUrl,
-		"expectedStatus": a.expectedStatus,
-		"fixed":          a.selected,
-		"hidden":         a.Hidden(),
-		"icon":           a.Icon(),
-		"emptyFallback":  a.EmptyFallback().Name(),
-		"affinityTTL":    time.Duration(a.affinityTTL.Load()) / time.Second,
-		"affinity":       affinity,
+		"type":            a.Type().String(),
+		"now":             a.Now(),
+		"all":             all,
+		"testUrl":         a.testUrl,
+		"expectedStatus":  a.expectedStatus,
+		"fixed":           a.selected,
+		"hidden":          a.Hidden(),
+		"icon":            a.Icon(),
+		"emptyFallback":   a.EmptyFallback().Name(),
+		"autoSelect":      a.autoSelect.Load(),
+		"autoSelectPorts": sortedPorts(a.autoSelectPorts),
+		"fixedPorts":      sortedPorts(a.fixedPorts),
+		"affinityTTL":     time.Duration(a.affinityTTL.Load()) / time.Second,
+		"affinity":        affinity,
 	})
 }
 
@@ -392,6 +458,29 @@ func (a *AutoURLTest) ClearAffinity() {
 	a.affinity.Clear()
 }
 
+// SetAutoSelect toggles per-target affinity auto-selection as the default
+// for inbound ports not covered by fixed-ports/auto-select-ports. When
+// disabled, those ports degrade to plain url-test behavior: every dial goes
+// straight through the current fastest (fixed) node and no per-target
+// affinity lookup, background probing or affinity recording happens.
+func (a *AutoURLTest) SetAutoSelect(b bool) {
+	if a.autoSelect.Load() == b {
+		return
+	}
+	a.autoSelect.Store(b)
+	if !b {
+		// dropping auto-selection also drops all recorded per-target
+		// affinity and in-flight probe state, and forces the fast node to
+		// be re-evaluated on the next dial
+		a.affinity.Clear()
+		a.probing.Range(func(key string, s *singledo.Single[struct{}]) bool {
+			a.probing.Delete(key)
+			return true
+		})
+		a.fastSingle.Reset()
+	}
+}
+
 func NewAutoURLTest(option GroupCommonOption, opt AutoURLTestOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*AutoURLTest, error) {
 	if emptyFallback == nil {
 		return nil, errors.New("empty fallback proxy not exist")
@@ -413,13 +502,16 @@ func NewAutoURLTest(option GroupCommonOption, opt AutoURLTestOption, emptyFallba
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
 		}),
-		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
-		affinity:       &xsync.Map[string, affinityEntry]{},
-		probing:        &xsync.Map[string, *singledo.Single[struct{}]]{},
-		tolerance:      opt.Tolerance,
-		disableUDP:     option.DisableUDP,
-		affinityTTL:    atomic.NewInt64(int64(time.Duration(opt.AffinityTTL) * time.Second)),
-		testUrl:        option.URL,
-		expectedStatus: option.ExpectedStatus,
+		fastSingle:      singledo.NewSingle[C.Proxy](time.Second * 10),
+		affinity:        &xsync.Map[string, affinityEntry]{},
+		probing:         &xsync.Map[string, *singledo.Single[struct{}]]{},
+		tolerance:       opt.Tolerance,
+		disableUDP:      option.DisableUDP,
+		affinityTTL:     atomic.NewInt64(int64(time.Duration(opt.AffinityTTL) * time.Second)),
+		autoSelect:      atomic.NewBool(opt.AutoSelect == nil || *opt.AutoSelect),
+		autoSelectPorts: portSet(opt.AutoSelectPorts),
+		fixedPorts:      portSet(opt.FixedPorts),
+		testUrl:         option.URL,
+		expectedStatus:  option.ExpectedStatus,
 	}, nil
 }

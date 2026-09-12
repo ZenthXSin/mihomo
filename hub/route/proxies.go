@@ -77,6 +77,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		Name          string `json:"name"`
 		AffinityTTL   *int   `json:"affinityTTL"`
 		ClearAffinity bool   `json:"clearAffinity"`
+		AutoSelect    *bool  `json:"autoSelect"`
 	}{}
 	if err := render.DecodeJSON(r.Body, &req); err != nil {
 		render.Status(r, http.StatusBadRequest)
@@ -99,6 +100,11 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.ClearAffinity {
 			autoURLTest.ClearAffinity()
+			render.NoContent(w, r)
+			return
+		}
+		if req.AutoSelect != nil {
+			autoURLTest.SetAutoSelect(*req.AutoSelect)
 			render.NoContent(w, r)
 			return
 		}

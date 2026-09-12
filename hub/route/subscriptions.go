@@ -104,9 +104,11 @@ func subscriptionIDFromRequest(r *http.Request) int {
 	return id
 }
 
-// subscriptionSettings resolves the raw subscription config with defaults applied.
-func subscriptionSettings() config.RawSubscription {
-	cfg := config.GetSubscriptionCfg()
+// normalizeSubscriptionConfig applies the defaults the subscription management
+// layer relies on, so a RawSubscription parsed out of a document can be compared
+// with the operator's global config on equal footing even when optional fields
+// (ua, timeout, subconverter-port, ...) are left unset.
+func normalizeSubscriptionConfig(cfg config.RawSubscription) config.RawSubscription {
 	if cfg.SubconverterPort == 0 {
 		cfg.SubconverterPort = 25500
 	}
@@ -139,6 +141,11 @@ func subscriptionSettings() config.RawSubscription {
 		cfg.RuntimeFile = filepath.Join(cfg.Directory, cfg.RuntimeFile)
 	}
 	return cfg
+}
+
+// subscriptionSettings resolves the raw subscription config with defaults applied.
+func subscriptionSettings() config.RawSubscription {
+	return normalizeSubscriptionConfig(config.GetSubscriptionCfg())
 }
 
 func isPathWithin(base, p string) bool {
@@ -497,18 +504,73 @@ func writeMergeExpressionFile(dir string) (string, error) {
 	return name, nil
 }
 
+// checkSubscriptionSection verifies that a merged runtime's top-level
+// `subscription:` section matches the operator's global subscription config and
+// returns it verbatim so reloadRuntime can persist it. The merged runtime
+// inherits the section from the operator's mixin, so a match proves it is
+// operator-sourced; a low-trust subscription smuggling its own section will
+// disagree with the global config and must be rejected with
+// errRejectedSubscription. Both sides are compared after the same defaults
+// normalization (subscriptionSettings), so a mixin that omits ua/timeout is
+// still accepted when the global config only relies on their defaults.
+func checkSubscriptionSection(runtimeData []byte, settings config.RawSubscription) (map[string]any, error) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(runtimeData, &doc); err != nil {
+		return nil, errRejectedSubscription
+	}
+	raw, ok := doc["subscription"]
+	if !ok {
+		return nil, errRejectedSubscription
+	}
+	section, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errRejectedSubscription
+	}
+	data, err := yaml.Marshal(section)
+	if err != nil {
+		return nil, errRejectedSubscription
+	}
+	var merged config.RawSubscription
+	if err := yaml.Unmarshal(data, &merged); err != nil {
+		return nil, errRejectedSubscription
+	}
+	if normalizeSubscriptionConfig(merged) != settings {
+		return nil, errRejectedSubscription
+	}
+	return section, nil
+}
+
+// reInjectSubscription puts a previously verified `subscription:` section back
+// into a sanitized runtime document, so runtime.yaml persists the operator's
+// subscription config across restarts (the kernel reads it back at startup).
+func reInjectSubscription(data []byte, subscription map[string]any) ([]byte, error) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	doc["subscription"] = subscription
+	return yaml.Marshal(doc)
+}
+
 // reloadRuntime validates the merged runtime config and applies it without
 // killing the process, then persists it to runtime.yaml.
 func reloadRuntime(ctx context.Context, settings config.RawSubscription, runtimeData []byte) error {
 	// the merged runtime is derived from untrusted subscription content:
 	// a top-level `subscription:` section must never reach the parser, as it
-	// would redirect the API to attacker-controlled paths/binaries. Reject it.
+	// would redirect the API to attacker-controlled paths/binaries. The one
+	// exception is the operator's own mixin, which legitimately carries the
+	// global subscription config: accept (and persist) that section only when
+	// it matches the global config, reject anything else.
 	sanitized, hadKey, err := sanitizeUntrustedConfig(runtimeData)
 	if err != nil {
 		return fmt.Errorf("merged runtime config is invalid: %w", err)
 	}
+	var subscription map[string]any
 	if hadKey {
-		return errRejectedSubscription
+		subscription, err = checkSubscriptionSection(runtimeData, subscriptionSettings())
+		if err != nil {
+			return err
+		}
 	}
 
 	runtimeData, err = ensureAutoGroup(sanitized)
@@ -522,6 +584,16 @@ func reloadRuntime(ctx context.Context, settings config.RawSubscription, runtime
 	cfg, err := executor.ParseWithBytes(runtimeData)
 	if err != nil {
 		return fmt.Errorf("merged runtime config is invalid: %w", err)
+	}
+
+	// the parsed config deliberately excluded the `subscription:` section;
+	// re-inject the operator's verified section only into the bytes that are
+	// persisted, so runtime.yaml keeps it across restarts
+	if subscription != nil {
+		runtimeData, err = reInjectSubscription(runtimeData, subscription)
+		if err != nil {
+			return fmt.Errorf("merged runtime config is invalid: %w", err)
+		}
 	}
 	if err := atomicWriteFile(settings.RuntimeFile, runtimeData, 0o644); err != nil {
 		return err
